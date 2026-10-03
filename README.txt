@@ -9,6 +9,7 @@ It includes its own .w3strings reader/writer with support for:
 Files
 -----
 - dual_subtitles_remastered.py
+- recap_subs_pipeline.py
 - build_exe.bat
 
 Requirements
@@ -42,10 +43,11 @@ UI mode:
 
 UI actions:
 
-- Apply Merge: merges added translation language into modified language.
-- Restore From Backup (Ctrl+Z): restores modified language from `*_backup.w3strings` files.
-- Blind Undo Last Action (Ctrl+Shift+Z): restores files to the exact state before the last matching merge action
-    (based on source language + target language + selected folder).
+- Apply Dual Subtitles: single button that applies dual subtitles for both
+    .w3strings files and intro/recap subtitles in movies.bundle.
+- Restore From Backup (Ctrl+Z): single undo button that restores both
+    .w3strings backup files and recap bundle backup.
+- Long operations run in the background and show a loading bar; the UI stays responsive while processing.
 - Clear Log: clears output panel.
 
 Batch mode:
@@ -55,6 +57,68 @@ Batch mode:
 Example:
 
     python dual_subtitles_remastered.py tr en "C:\Program Files (x86)\Steam\steamapps\common\The Witcher 3"
+
+Intro/Recap subtitle pipeline (movies.bundle)
+---------------------------------------------
+The recap subtitles shown during intro/loading are not part of .w3strings.
+The UI already applies this automatically, but this script can be used separately
+to inspect files, generate merged recap text, and optionally create a patched bundle copy.
+
+Where the intro text actually comes from:
+
+- movies\cutscenes\gamestart\recap_wip.usm (the intro cinematic) contains its own
+    embedded subtitle stream (CRI Sofdec @SBT chunks) with 15 language channels:
+    en, pl, de, it, fr, cz, es, zh, ru, cn, jp, kr, br, esmx, ar.
+- When the game text language has an embedded channel, the game renders THAT text and
+    ignores movies\cutscenes\gamestart\subs\recap_wip_<lang>.subs.
+- Languages without a channel (tr, hu, ua) fall back to the .subs file.
+- The tool therefore patches both: the .subs file (for fallback languages) and the
+    embedded channel of the target language inside recap_wip.usm (rewritten chunks are
+    re-padded to 32 bytes, the CRID file size is updated, and the SBT header limits are
+    raised only if the merged text exceeds the original maximums).
+- The rewritten movie is appended to the bundle and the TOC entry is repointed; nothing
+    inside the original data is overwritten, so the backup/restore flow stays the same.
+
+content\metadata.store:
+
+- The game does not look up files through the bundle TOC at runtime; it uses
+    content\metadata.store, which holds its own offset/size per file.
+- When bundle sizes no longer match the store, the game rebuilds metadata.store on launch
+    (observed: new file written a few seconds after start). The first start after
+    applying or restoring may take slightly longer.
+- If the intro ever shows stale text after a patch/restore, start the game once with the
+    launch option -rebuild-store (witcher3.exe supports it) or verify files via Steam.
+
+Generate extraction + merged files only:
+
+    python recap_subs_pipeline.py --bundle "C:\Program Files (x86)\Steam\steamapps\common\The Witcher 3\content\content0\bundles\movies.bundle" --output-dir ".\tools\recap_build" --target-lang en --source-lang tr
+
+Generate extraction + merged files + patched bundle copy:
+
+    python recap_subs_pipeline.py --bundle "C:\Program Files (x86)\Steam\steamapps\common\The Witcher 3\content\content0\bundles\movies.bundle" --output-dir ".\tools\recap_build" --target-lang en --source-lang tr --patched-bundle ".\tools\recap_build\movies.patched.bundle"
+
+Separator options:
+
+- same-line (default): appends source with " | " delimiter.
+- escaped-newline: appends source as literal "\\n" after target.
+- actual-newline: appends source with real newline character.
+
+Intro visibility note:
+
+- In the main app flow, recap lines are written as source-first (for example TR | EN)
+    so the added language stays visible even when intro subtitle space is limited.
+- In recap_subs_pipeline.py CLI, add --source-first for the same ordering.
+- The CLI also rewrites the embedded USM channel by default and writes
+    <output-dir>\usm\recap_wip.patched.usm plus sbt_<target>_<source>.txt for inspection.
+    Use --no-usm to skip that step.
+
+Important:
+
+- In UI mode, the game movies.bundle is patched in place after creating a local backup file.
+- In CLI mode for recap_subs_pipeline.py, the original bundle is not modified unless
+    you explicitly choose to write a patched output bundle.
+- --patched-bundle writes a new copied bundle file.
+- Keep your own backup and test on a copied game file/mod setup first.
 
 How it works
 ------------

@@ -1,14 +1,18 @@
 import os
 import json
+import queue
 import shutil
 import struct
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter import ttk
+
+import recap_subs_pipeline
 
 # File format constants
 MAGIC_BYTES = b"RTSW"
@@ -92,6 +96,11 @@ def _state_root_dir():
 STATE_ROOT_DIR = _state_root_dir()
 UNDO_HISTORY_DIR = os.path.join(STATE_ROOT_DIR, "undo_history")
 UNDO_HISTORY_INDEX = os.path.join(UNDO_HISTORY_DIR, "history.json")
+
+RECAP_BUNDLE_RELATIVE_PARTS = ("content", "content0", "bundles", "movies.bundle")
+RECAP_BUNDLE_BACKUP_SUFFIX = ".dualsub_backup"
+RECAP_SEPARATOR_STYLE = "same-line"
+APP_VERSION = "2026.10.03.2"
 
 
 def _ensure_dir(path):
@@ -565,6 +574,26 @@ def write_w3strings(path, data):
         f.write(struct.pack("<H", key2))
 
 
+def _supports_html_line_break(text):
+    lower_text = text.lower()
+    # Some UI channels display plain text and render '<br>' literally.
+    # Only inject HTML breaks if the original text already uses HTML-like markup.
+    return any(
+        marker in lower_text
+        for marker in (
+            "<br",
+            "<font",
+            "<i>",
+            "</i>",
+            "<b>",
+            "</b>",
+            "<img",
+            "<a ",
+            "<span",
+        )
+    )
+
+
 def merge_entries(source_file, target_file):
     source_map = {entry.str_id: entry.text for entry in source_file.strings}
     changed = 0
@@ -585,8 +614,10 @@ def merge_entries(source_file, target_file):
         if source_text in target_text:
             continue
 
-        # Preserve readability: long lines use HTML line-break, short lines stay inline.
-        delimiter = "<br>~ " if len(entry.text) > 20 else " ~ "
+        if _supports_html_line_break(entry.text) and len(entry.text) > 20:
+            delimiter = "<br>~ "
+        else:
+            delimiter = " ~ "
         entry.text = f"{entry.text}{delimiter}{source_text}"
         changed += 1
 
@@ -609,6 +640,138 @@ def _resolve_case_insensitive_file(directory, file_name):
     return direct_path
 
 
+def _locate_recap_bundle(location):
+    direct_dir = os.path.join(location, *RECAP_BUNDLE_RELATIVE_PARTS[:-1])
+    direct_name = RECAP_BUNDLE_RELATIVE_PARTS[-1]
+    direct_path = _resolve_case_insensitive_file(direct_dir, direct_name)
+    if os.path.exists(direct_path):
+        return direct_path
+
+    suffix = os.path.join(*RECAP_BUNDLE_RELATIVE_PARTS[:-1]).lower()
+    for root, _, files in os.walk(location):
+        if os.path.normcase(root).lower().endswith(os.path.normcase(suffix).lower()):
+            for name in files:
+                if name.lower() == direct_name.lower():
+                    return os.path.join(root, name)
+
+    return None
+
+
+def _recap_backup_path(bundle_path):
+    return f"{bundle_path}{RECAP_BUNDLE_BACKUP_SUFFIX}"
+
+
+def apply_recap_dual_subtitles(source_lang, target_lang, location):
+    source_lang = source_lang.lower()
+    target_lang = target_lang.lower()
+
+    bundle_path = _locate_recap_bundle(location)
+    if bundle_path is None:
+        print("Recap bundle not found; skipping intro/recap dual subtitle step.")
+        return False, 0
+
+    backup_path = _recap_backup_path(bundle_path)
+    if not os.path.exists(backup_path):
+        shutil.copy2(bundle_path, backup_path)
+        print(f"Recap backup created: {backup_path}")
+
+    # Always reset to clean backup so repeated runs remain deterministic.
+    shutil.copy2(backup_path, bundle_path)
+
+    if source_lang == target_lang:
+        print("Recap bundle restored from backup (source and target languages are the same).")
+        return True, 0
+
+    try:
+        payload = recap_subs_pipeline.build_merged_recap_payload(
+            bundle_path=bundle_path,
+            target_lang=target_lang,
+            source_lang=source_lang,
+            separator_style=RECAP_SEPARATOR_STYLE,
+            source_first=True,
+        )
+        patched = recap_subs_pipeline.patch_bundle_in_place(
+            bundle_path=bundle_path,
+            entry_to_patch=payload["target_entry"],
+            merged_raw=payload["merged_raw"],
+            align=16,
+        )
+        print(
+            "Recap merge applied: "
+            f"{payload['target_entry'].name} + {payload['source_entry'].name} "
+            f"({len(payload['merged_records'])} records)"
+        )
+        print(f"Recap bundle patched: {patched['output_bundle']}")
+    except Exception as exc:
+        print("FAILURE TO PROCESS recap bundle")
+        print(str(exc))
+        return True, 1
+
+    # The intro movie (recap_wip.usm) carries its own embedded subtitle channels.
+    # For languages that have a channel (en, de, fr, ...) the game shows those and
+    # ignores the .subs file, so the channel itself must be rewritten.
+    try:
+        usm_result = recap_subs_pipeline.build_merged_recap_usm(
+            bundle_path=bundle_path,
+            target_lang=target_lang,
+            source_lang=source_lang,
+            separator_style=RECAP_SEPARATOR_STYLE,
+            source_first=True,
+        )
+        if usm_result is None:
+            print(
+                f"Intro movie has no embedded '{target_lang}' subtitle channel; "
+                "the game uses the patched .subs file for the intro."
+            )
+        else:
+            for warning in usm_result["warnings"]:
+                print(f"WARNING: {warning}")
+            usm_patch = recap_subs_pipeline.patch_bundle_entry_in_place(
+                bundle_path=bundle_path,
+                entry_to_patch=usm_result["usm_entry"],
+                raw=usm_result["new_raw"],
+                compress=False,
+                align=4096,
+            )
+            print(
+                "Intro movie subtitles rewritten: "
+                f"{usm_result['usm_entry'].name} channel {usm_result['channel']} "
+                f"({usm_result['lines_modified']}/{usm_result['lines_total']} lines, "
+                f"{usm_result['original_size']} -> {len(usm_result['new_raw'])} bytes)"
+            )
+            print(f"Intro movie appended at bundle offset {usm_patch['new_offset']}")
+        print(
+            "Note: the game rebuilds content\\metadata.store on the next launch "
+            "because the bundle size changed; the first start may take a bit longer."
+        )
+        return True, 0
+    except Exception as exc:
+        print("FAILURE TO PROCESS intro movie subtitles (recap_wip.usm)")
+        print(str(exc))
+        return True, 1
+
+
+def restore_recap_bundle_backup(location):
+    bundle_path = _locate_recap_bundle(location)
+    if bundle_path is None:
+        print("Recap bundle not found; skipping intro/recap undo step.")
+        return False, 0, 0
+
+    backup_path = _recap_backup_path(bundle_path)
+    if not os.path.exists(backup_path):
+        print("No recap backup bundle found.")
+        return True, 0, 0
+
+    try:
+        shutil.copy2(backup_path, bundle_path)
+        print(f"Recap bundle restored: {bundle_path}")
+        return True, 1, 0
+    except Exception as exc:
+        print(f"FAILURE TO RESTORE recap bundle {bundle_path}")
+        print(str(exc))
+        return True, 0, 1
+
+
 def process_files(source_lang, target_lang, location):
     source_lang = source_lang.lower()
     target_lang = target_lang.lower()
@@ -627,7 +790,7 @@ def process_files(source_lang, target_lang, location):
             _ensure_dir(operation_dir)
             operation_storage_ready = True
         except Exception as exc:
-            print("WARNING - blind undo snapshots are disabled for this run.")
+            print("WARNING - merge snapshots are disabled for this run.")
             print(str(exc))
 
     print(f"Starting {source_lang} {target_lang} {location}")
@@ -654,7 +817,7 @@ def process_files(source_lang, target_lang, location):
                     }
                 )
             except Exception as exc:
-                print(f"WARNING - failed to create blind undo snapshot for: {target_path}")
+                print(f"WARNING - failed to create merge snapshot for: {target_path}")
                 print(str(exc))
 
         base_name, _ = os.path.splitext(target_path)
@@ -702,7 +865,7 @@ def process_files(source_lang, target_lang, location):
             failed=failed,
         )
         if history_id:
-            print(f"Blind undo record id: {history_id}")
+            print(f"Merge snapshot record id: {history_id}")
     elif should_merge and operation_storage_ready:
         # Nothing was captured; drop the empty operation folder to avoid stale entries.
         shutil.rmtree(operation_dir, ignore_errors=True)
@@ -834,30 +997,57 @@ class _TextRedirector:
     def __init__(self, text_widget, window):
         self.text_widget = text_widget
         self.window = window
+        self.pending = queue.Queue()
+        self.is_alive = True
+        self.window.after(40, self._flush_pending)
+
+    def _flush_pending(self):
+        if not self.is_alive:
+            return
+
+        chunks = []
+        while True:
+            try:
+                chunks.append(self.pending.get_nowait())
+            except queue.Empty:
+                break
+
+        if chunks:
+            combined = "".join(chunks)
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert(tk.END, combined)
+            self.text_widget.see(tk.END)
+            self.text_widget.configure(state="disabled")
+
+        try:
+            self.window.after(40, self._flush_pending)
+        except tk.TclError:
+            # The window may be closing; stop scheduling further flushes.
+            self.is_alive = False
 
     def write(self, text):
         if not text:
             return
 
-        self.text_widget.configure(state="normal")
-        self.text_widget.insert(tk.END, text)
-        self.text_widget.see(tk.END)
-        self.text_widget.configure(state="disabled")
-        self.window.update_idletasks()
+        self.pending.put(text)
 
     def flush(self):
         pass
+
+    def close(self):
+        self.is_alive = False
 
 
 def redirect_output(text_widget, window):
     stream = _TextRedirector(text_widget, window)
     sys.stdout = stream
     sys.stderr = stream
+    return stream
 
 
 def open_ui_dialog():
     window = tk.Tk()
-    window.title("Witcher 3 Dual Subtitles - Remastered")
+    window.title(f"Witcher 3 Dual Subtitles - Remastered v{APP_VERSION}")
     window.minsize(840, 600)
 
     palette = _configure_styles(window)
@@ -924,6 +1114,9 @@ def open_ui_dialog():
     button_row.pack(fill="x", pady=(14, 10))
 
     status_var = tk.StringVar(value="Ready.")
+    busy_hint_var = tk.StringVar(value="")
+    worker_result_queue = queue.Queue()
+    active_worker = {"thread": None}
 
     def clear_log():
         output_text.configure(state="normal")
@@ -936,21 +1129,101 @@ def open_ui_dialog():
 
         run_button.configure(state=state)
         undo_button.configure(state=state)
-        blind_undo_button.configure(state=state)
         clear_button.configure(state=state)
         browse_button.configure(state=state)
         source_language_combo.configure(state=combo_state)
         target_language_combo.configure(state=combo_state)
         folder_entry.configure(state=state)
 
+        if is_busy:
+            progress_bar.start(12)
+            busy_hint_var.set("Please wait... Processing files in the background.")
+        else:
+            progress_bar.stop()
+            busy_hint_var.set("")
+
         window.configure(cursor="watch" if is_busy else "")
         window.update_idletasks()
 
+    def _poll_worker_result():
+        worker = active_worker.get("thread")
+        if worker is None:
+            return
+
+        try:
+            result = worker_result_queue.get_nowait()
+        except queue.Empty:
+            if worker.is_alive():
+                window.after(120, _poll_worker_result)
+            else:
+                active_worker["thread"] = None
+                set_busy(False)
+                status_var.set("Completed. Check the log.")
+            return
+
+        active_worker["thread"] = None
+        set_busy(False)
+        status_var.set(result["status"])
+
+        error_text = result.get("error")
+        if error_text:
+            messagebox.showerror("Processing failed", error_text)
+
+    def _run_action_worker(action, source_lang, target_lang, selected_folder):
+        result = {"status": "Done.", "error": ""}
+
+        try:
+            print("\n" + "=" * 70)
+            if action == "undo":
+                print(f"Undo requested for language: {target_lang}")
+                print(f"Selected folder: {selected_folder}")
+                restored, failed = restore_from_backups(target_lang, selected_folder)
+                recap_found, recap_restored, recap_failed = restore_recap_bundle_backup(selected_folder)
+
+                if failed == 0 and recap_failed == 0 and (restored > 0 or recap_restored > 0):
+                    result["status"] = "Undo completed."
+                elif restored > 0 or recap_restored > 0:
+                    result["status"] = "Undo completed with some errors. Check log."
+                elif recap_found:
+                    result["status"] = "No backups found to undo."
+                else:
+                    result["status"] = "No backups found to undo."
+            else:
+                print(f"Merge started: {source_lang} -> {target_lang}")
+                print(f"Selected folder: {selected_folder}")
+                process_files(source_lang, target_lang, selected_folder)
+                recap_found, recap_failed = apply_recap_dual_subtitles(
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    location=selected_folder,
+                )
+
+                if recap_failed:
+                    result["status"] = "Merge completed with intro/recap errors. Check log."
+                elif recap_found:
+                    result["status"] = "Merge completed (w3strings + intro/recap)."
+                else:
+                    result["status"] = "Merge completed (.w3strings only; recap bundle not found)."
+
+            print("--- DONE !       ---")
+            print("--- You can exit ---")
+            print("To restore defaults, use the same source and base languages.")
+        except Exception as exc:
+            result["status"] = "Completed with errors. Check the log."
+            result["error"] = str(exc)
+            print(f"Unexpected error: {exc}")
+
+        worker_result_queue.put(result)
+
     def run_process(action="merge"):
+        current_worker = active_worker.get("thread")
+        if current_worker and current_worker.is_alive():
+            status_var.set("A task is already running. Please wait.")
+            return
+
         target_lang = target_language_combo.get().strip().lower()
         source_lang = source_language_combo.get().strip().lower()
         selected_folder = folder_var.get().strip()
-        selected_operation = None
 
         if not selected_folder:
             messagebox.showwarning("Missing folder", "Please select your Witcher 3 folder.")
@@ -963,94 +1236,35 @@ def open_ui_dialog():
             )
             return
 
-        if action == "blind_undo":
-            selected_operation = _find_latest_merge_operation(
-                source_lang=source_lang,
-                target_lang=target_lang,
-                location=selected_folder,
-            )
-
-            if selected_operation is None:
-                status_var.set("No matching blind undo record found.")
-                messagebox.showinfo(
-                    "No blind undo record",
-                    "No matching merge action was found for the selected source/target languages and folder."
-                    "\n\nRun a merge first, then try Blind Undo.",
-                )
-                return
-
-            summary = (
-                f"Operation: {selected_operation.get('source_lang')} -> "
-                f"{selected_operation.get('target_lang')}\n"
-                f"Date: {selected_operation.get('created_at')}\n"
-                f"Files: {len(selected_operation.get('files', []))}\n\n"
-                "Continue with blind undo?"
-            )
-            if not messagebox.askyesno("Confirm Blind Undo", summary):
-                status_var.set("Blind undo canceled.")
-                return
-
         if action == "merge":
             summary = (
                 f"Target language (will be modified): {target_lang}\n"
                 f"Source language (will be appended): {source_lang}\n"
                 f"Folder: {selected_folder}\n\n"
+                "This applies dual subtitles for both regular .w3strings and intro/recap subtitles.\n\n"
                 "Continue with merge?"
             )
             if not messagebox.askyesno("Confirm Merge", summary):
                 status_var.set("Merge canceled.")
                 return
 
-        if action == "undo_backup":
-            action_name = "Restore"
-        elif action == "blind_undo":
-            action_name = "Blind Undo"
-        else:
-            action_name = "Merge"
+        action_name = "Restore" if action == "undo" else "Merge"
 
-        status_var.set(f"{action_name} in progress...")
+        status_var.set(f"{action_name} in progress... Please wait.")
         set_busy(True)
 
-        try:
-            print("\n" + "=" * 70)
-            if action == "undo_backup":
-                print(f"Undo requested for language: {target_lang}")
-                print(f"Selected folder: {selected_folder}")
-                restored, failed = restore_from_backups(target_lang, selected_folder)
-                if restored > 0 and failed == 0:
-                    status_var.set("Undo completed.")
-                elif restored > 0:
-                    status_var.set("Undo completed with some errors. Check log.")
-                else:
-                    status_var.set("No backups found to undo.")
-            elif action == "blind_undo":
-                operation_id = selected_operation["id"]
-                print(f"Blind undo requested for operation id: {operation_id}")
-                restored, failed = blind_undo_operation(operation_id)
-                if restored > 0 and failed == 0:
-                    status_var.set("Blind undo completed.")
-                elif restored > 0:
-                    status_var.set("Blind undo completed with some errors. Check log.")
-                else:
-                    status_var.set("Blind undo failed. Check log.")
-            else:
-                print(f"Merge started: {source_lang} -> {target_lang}")
-                print(f"Selected folder: {selected_folder}")
-                process_files(source_lang, target_lang, selected_folder)
-                status_var.set("Merge completed successfully.")
-            print("--- DONE !       ---")
-            print("--- You can exit ---")
-            print("To restore defaults, use the same source and base languages.")
-        except Exception as exc:
-            status_var.set("Completed with errors. Check the log.")
-            print(f"Unexpected error: {exc}")
-            messagebox.showerror("Processing failed", str(exc))
-        finally:
-            set_busy(False)
+        worker = threading.Thread(
+            target=_run_action_worker,
+            args=(action, source_lang, target_lang, selected_folder),
+            daemon=True,
+        )
+        active_worker["thread"] = worker
+        worker.start()
+        window.after(120, _poll_worker_result)
 
     run_button = ttk.Button(
         button_row,
-        text="Apply Merge",
+        text="Apply Dual Subtitles",
         style="Accent.TButton",
         command=lambda: run_process(action="merge"),
     )
@@ -1060,17 +1274,9 @@ def open_ui_dialog():
         button_row,
         text="Restore From Backup (Ctrl+Z)",
         style="Neutral.TButton",
-        command=lambda: run_process(action="undo_backup"),
+        command=lambda: run_process(action="undo"),
     )
     undo_button.pack(side="left", padx=(8, 0))
-
-    blind_undo_button = ttk.Button(
-        button_row,
-        text="Blind Undo Last Action (Ctrl+Shift+Z)",
-        style="Neutral.TButton",
-        command=lambda: run_process(action="blind_undo"),
-    )
-    blind_undo_button.pack(side="left", padx=(8, 0))
 
     clear_button = ttk.Button(
         button_row,
@@ -1081,6 +1287,10 @@ def open_ui_dialog():
     clear_button.pack(side="left", padx=(8, 0))
 
     ttk.Label(card, textvariable=status_var, style="Status.TLabel").pack(anchor="w", pady=(0, 8))
+    ttk.Label(card, textvariable=busy_hint_var, style="Status.TLabel").pack(anchor="w", pady=(0, 6))
+
+    progress_bar = ttk.Progressbar(card, mode="indeterminate")
+    progress_bar.pack(fill="x", pady=(0, 10))
 
     output_text = scrolledtext.ScrolledText(
         card,
@@ -1098,24 +1308,24 @@ def open_ui_dialog():
     output_text.pack(fill="both", expand=True)
     output_text.configure(state="disabled")
 
-    redirect_output(output_text, window)
+    log_stream = redirect_output(output_text, window)
     print("UI ready.")
-    print(
-        "Tip: Ctrl+Z backup restore, Ctrl+Shift+Z blind undo history."
-    )
+    print(f"Build: {APP_VERSION}")
+    print(f"Recap separator mode: {RECAP_SEPARATOR_STYLE}")
+    print("Tip: Ctrl+Z restores both w3strings and intro/recap bundle backups.")
+
+    def on_close():
+        log_stream.close()
+        window.destroy()
+
+    window.protocol("WM_DELETE_WINDOW", on_close)
 
     def on_backup_undo_shortcut(_event=None):
-        run_process(action="undo_backup")
-        return "break"
-
-    def on_blind_undo_shortcut(_event=None):
-        run_process(action="blind_undo")
+        run_process(action="undo")
         return "break"
 
     window.bind_all("<Control-z>", on_backup_undo_shortcut)
     window.bind_all("<Control-Z>", on_backup_undo_shortcut)
-    window.bind_all("<Control-Shift-z>", on_blind_undo_shortcut)
-    window.bind_all("<Control-Shift-Z>", on_blind_undo_shortcut)
 
     window.update_idletasks()
     screen_width = window.winfo_screenwidth()
@@ -1146,6 +1356,14 @@ def main():
     location = sys.argv[3]
 
     process_files(source_lang, target_lang, location)
+    recap_found, recap_failed = apply_recap_dual_subtitles(source_lang, target_lang, location)
+
+    if recap_failed:
+        print("Recap merge finished with errors.")
+    elif recap_found:
+        print("Recap merge finished successfully.")
+    else:
+        print("Recap bundle not found; recap step skipped.")
 
 
 if __name__ == "__main__":
