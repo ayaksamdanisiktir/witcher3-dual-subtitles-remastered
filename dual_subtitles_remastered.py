@@ -103,9 +103,9 @@ RECAP_BUNDLE_BACKUP_SUFFIX = ".dualsub_backup"
 # Second language goes on the following line, not beside the first with a marker.
 # .subs files are line-based, so the break has to be an HTML <br> tag there;
 # embedded movie text (SBT) is length-prefixed and can hold a real newline.
-RECAP_SEPARATOR_STYLE = "html-break"
-RECAP_SBT_SEPARATOR_STYLE = "actual-newline"
-APP_VERSION = "2026.10.04.4"
+RECAP_SEPARATOR_STYLE = "carriage-return"  # .subs files (storybook recaps etc.)
+RECAP_SBT_SEPARATOR_STYLE = "actual-newline"  # embedded movie text (intro etc.)
+APP_VERSION = "2026.10.05.2"
 
 # Script mod that fills the $I$/$F$/$S$ placeholders in the second language too.
 SCRIPT_MOD_NAME = "modDualSubtitles"
@@ -667,6 +667,27 @@ def _supports_html_line_break(text):
     )
 
 
+SHORT_LABEL_MAX_TARGET_LEN = 25
+SHORT_LABEL_MAX_SOURCE_LEN = 30
+SHORT_LABEL_SEPARATOR = " / "
+_SENTENCE_PUNCTUATION = (".", "!", "?", "\u2026", ":", ";", ",")
+
+
+def _is_short_label(target_text, source_text):
+    """Short UI labels ("Required Level", "Weapons") get the second language on the
+    same line. Game scripts often append a value right after such labels
+    (label + " " + level); with a line break the value would land on the second
+    line, which single-line Flash fields clip."""
+    if len(target_text) > SHORT_LABEL_MAX_TARGET_LEN or len(source_text) > SHORT_LABEL_MAX_SOURCE_LEN:
+        return False
+    for text in (target_text, source_text):
+        if "<" in text or "$" in text or "\n" in text:
+            return False
+        if text.endswith(_SENTENCE_PUNCTUATION):
+            return False
+    return True
+
+
 def merge_entries(source_file, target_file):
     source_map = {entry.str_id: entry.text for entry in source_file.strings}
     changed = 0
@@ -682,12 +703,18 @@ def merge_entries(source_file, target_file):
         # Skip placeholder or control-token rows to avoid breaking UI/menu labels.
         if not source_text or source_text.startswith("#"):
             continue
-        if target_text.startswith("#"):
+        if not target_text or target_text.startswith("#"):
+            continue
+        # "[EN]"-style markers stand for "not translated yet"; nothing to append.
+        if re.fullmatch(r"\[[A-Za-z]{2,4}\]", source_text):
             continue
         if source_text in target_text:
             continue
 
-        if _supports_html_line_break(entry.text) and len(entry.text) > 20:
+        if _is_short_label(target_text, source_text):
+            # Keep short labels on one line so appended values stay visible.
+            delimiter = SHORT_LABEL_SEPARATOR
+        elif _supports_html_line_break(entry.text) and len(entry.text) > 20:
             # These rows already render HTML, so a break tag starts the second line.
             delimiter = "<br>"
         else:

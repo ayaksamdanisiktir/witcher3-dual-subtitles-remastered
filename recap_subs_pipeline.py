@@ -160,7 +160,9 @@ def parse_subtitle_records(text):
     header_value = None
     records = []
 
-    for line in text.splitlines():
+    # Split on LF (and CRLF) only: a lone CR inside the text is a line break
+    # for the renderer and must stay part of the record.
+    for line in text.replace("\r\n", "\n").split("\n"):
         stripped = line.strip()
         if not stripped:
             continue
@@ -192,9 +194,10 @@ def render_subtitle_text(header_value, records):
     'header\\r\\n' then one 'start, end, text\\r\\n' per record, no blank lines."""
     lines = [str(header_value)]
     for record in records:
-        # One record per line. A line break inside the text is stored as the
-        # two-character \n escape so it does not split the record.
-        text = record.text.replace("\r", "").replace("\n", "\\n")
+        # One record per line. A lone CR is kept (the game's line parser only
+        # splits on LF and the renderer shows CR as a line break); any LF inside
+        # the text is stored as the two-character \n escape.
+        text = record.text.replace("\r\n", "\n").replace("\n", "\\n")
         lines.append(f"{record.start_ms}, {record.end_ms}, {text}")
     return "\r\n".join(lines) + "\r\n"
 
@@ -202,7 +205,7 @@ def render_subtitle_text(header_value, records):
 PAIRING_TOLERANCE_MS = 2500
 
 
-SEPARATOR_STYLES = ("same-line", "escaped-newline", "actual-newline", "html-break")
+SEPARATOR_STYLES = ("same-line", "escaped-newline", "actual-newline", "html-break", "carriage-return")
 
 
 def separator_for_style(separator_style):
@@ -213,10 +216,14 @@ def separator_for_style(separator_style):
     if separator_style == "actual-newline":
         return "\n"
     if separator_style == "html-break":
-        # .subs files are parsed line by line, so a real newline would split the
-        # record. The text ends up in the HUD dialog subtitle field (HTML text),
-        # where <br> renders as a line break.
+        # <br> only works where the text is rendered as HTML; the storybook
+        # recap field shows it literally.
         return "<br>"
+    if separator_style == "carriage-return":
+        # For .subs files: the game's parser splits records on LF, so a lone CR
+        # survives inside the record, and the movie subtitle field renders it as
+        # a line break (verified in the storybook recaps).
+        return "\r"
     raise ValueError(f"Unknown separator style: {separator_style}")
 
 

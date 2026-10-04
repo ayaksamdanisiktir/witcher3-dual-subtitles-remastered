@@ -113,19 +113,25 @@ Separator options:
 - same-line (default): appends source with " | " delimiter.
 - escaped-newline: appends source as literal "\\n" after target.
 - actual-newline: appends source with real newline character.
-- html-break: appends source after a "<br>" tag.
+- html-break: appends source after a "<br>" tag (only works where the text is
+    rendered as HTML; the storybook recap field shows it literally).
+- carriage-return: appends source after a lone CR character. The game's .subs parser
+    splits records on LF only, so the CR stays inside the record, and the movie
+    subtitle field renders it as a line break (verified in the storybook recaps).
 
 Intro visibility note:
 
 - In the main app flow the second language is written on the next line, source-first
     (Turkish, then English on the line below).
-    * .subs files: "<br>" (the file is parsed line by line, so a real newline would
-      split the record; the text is shown by the HUD dialog subtitle field, which
-      renders HTML).
+    * .subs files: a lone CR (carriage-return style, see above).
     * embedded movie text (SBT): a real newline character.
-    * .w3strings: a real newline for plain text, <br> for rows that already contain HTML.
+    * .w3strings: a real newline for plain text, <br> for rows that already contain
+      HTML, and " / " on the same line for short labels (<= 25 chars, no sentence
+      punctuation). Scripts append values right after such labels
+      ("Required Level" + " " + level); with a line break the value would land on
+      the second line, which single-line fields clip.
 - In recap_subs_pipeline.py CLI the default is still same-line (" | ").
-    Use --separator-style html-break --source-first to match the app's .subs output.
+    Use --separator-style carriage-return --source-first to match the app's .subs output.
 - The CLI also rewrites the embedded USM channel by default and writes
     <output-dir>\usm\recap_wip.patched.usm plus sbt_<target>_<source>.txt for inspection.
     Use --no-usm to skip that step.
