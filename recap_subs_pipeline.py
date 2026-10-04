@@ -190,7 +190,10 @@ def parse_subtitle_records(text):
 def render_subtitle_text(header_value, records):
     lines = [str(header_value), ""]
     for record in records:
-        lines.append(f"{record.start_ms}, {record.end_ms}, {record.text}")
+        # One record per line. A line break inside the text is stored as the
+        # two-character \n escape so it does not split the record.
+        text = record.text.replace("\n", "\\n")
+        lines.append(f"{record.start_ms}, {record.end_ms}, {text}")
         lines.append("")
     return "\n".join(lines) + "\n"
 

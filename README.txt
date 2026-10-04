@@ -105,9 +105,12 @@ Separator options:
 
 Intro visibility note:
 
-- In the main app flow, recap lines are written as source-first (for example TR | EN)
-    so the added language stays visible even when intro subtitle space is limited.
-- In recap_subs_pipeline.py CLI, add --source-first for the same ordering.
+- In the main app flow the second language is written on the next line, source-first
+    (Turkish, then English on the line below). The in-game .w3strings texts use the
+    same line break: a real newline for plain subtitles, <br> for rows that already
+    contain HTML.
+- In recap_subs_pipeline.py CLI the default is still same-line (" | ").
+    Use --separator-style actual-newline --source-first to match the app.
 - The CLI also rewrites the embedded USM channel by default and writes
     <output-dir>\usm\recap_wip.patched.usm plus sbt_<target>_<source>.txt for inspection.
     Use --no-usm to skip that step.

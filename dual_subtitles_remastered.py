@@ -99,8 +99,9 @@ UNDO_HISTORY_INDEX = os.path.join(UNDO_HISTORY_DIR, "history.json")
 
 RECAP_BUNDLE_RELATIVE_PARTS = ("content", "content0", "bundles", "movies.bundle")
 RECAP_BUNDLE_BACKUP_SUFFIX = ".dualsub_backup"
-RECAP_SEPARATOR_STYLE = "same-line"
-APP_VERSION = "2026.10.03.2"
+# Second language goes on the following line, not beside the first with a marker.
+RECAP_SEPARATOR_STYLE = "actual-newline"
+APP_VERSION = "2026.10.04.1"
 
 
 def _ensure_dir(path):
@@ -615,9 +616,12 @@ def merge_entries(source_file, target_file):
             continue
 
         if _supports_html_line_break(entry.text) and len(entry.text) > 20:
-            delimiter = "<br>~ "
+            # These rows already render HTML, so a break tag starts the second line.
+            delimiter = "<br>"
         else:
-            delimiter = " ~ "
+            # Plain subtitle and menu text. A real newline is a line break;
+            # a <br> tag would be shown as literal text on these channels.
+            delimiter = "\n"
         entry.text = f"{entry.text}{delimiter}{source_text}"
         changed += 1
 
