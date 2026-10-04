@@ -1,6 +1,7 @@
 import os
 import json
 import queue
+import re
 import shutil
 import struct
 import sys
@@ -100,8 +101,79 @@ UNDO_HISTORY_INDEX = os.path.join(UNDO_HISTORY_DIR, "history.json")
 RECAP_BUNDLE_RELATIVE_PARTS = ("content", "content0", "bundles", "movies.bundle")
 RECAP_BUNDLE_BACKUP_SUFFIX = ".dualsub_backup"
 # Second language goes on the following line, not beside the first with a marker.
-RECAP_SEPARATOR_STYLE = "actual-newline"
-APP_VERSION = "2026.10.04.1"
+# .subs files are line-based, so the break has to be an HTML <br> tag there;
+# embedded movie text (SBT) is length-prefixed and can hold a real newline.
+RECAP_SEPARATOR_STYLE = "html-break"
+RECAP_SBT_SEPARATOR_STYLE = "actual-newline"
+APP_VERSION = "2026.10.04.4"
+
+# Script mod that fills the $I$/$F$/$S$ placeholders in the second language too.
+SCRIPT_MOD_NAME = "modDualSubtitles"
+SCRIPT_MOD_MARKER = "// Dual Subtitles mod"
+ORIGINAL_SCRIPT_RELATIVE_PARTS = ("content", "content0", "scripts", "game", "localizedContent.ws")
+SCRIPT_MOD_RELATIVE_PARTS = ("mods", SCRIPT_MOD_NAME, "content", "scripts", "game", "localizedContent.ws")
+PLACEHOLDER_FUNCTIONS = (
+    # (function name, expression prefix used in the original replacement calls)
+    ("GetLocStringByKeyExtWithParams", "prefix + "),
+    ("GetLocStringByIdWithParams", ""),
+)
+PLACEHOLDER_SECOND_PASS_TEMPLATE = """
+	{marker}: a merged row contains every placeholder twice (once per language).
+	// The loops above filled the first language; when exactly one copy of each
+	// placeholder is left, fill the second language with the same values.
+	if ( intParamsArray.Size() > 0 && DualSub_CountOccurrences( resultString, "$I$" ) == intParamsArray.Size() )
+	{{
+		for( i = 0; i < intParamsArray.Size(); i += 1 )
+		{{
+			resultString = StrReplace( resultString, "$I$", {prefix}IntToString(intParamsArray[i]) );
+		}}
+	}}
+	if ( floatParamsArray.Size() > 0 && DualSub_CountOccurrences( resultString, "$F$" ) == floatParamsArray.Size() )
+	{{
+		for( i = 0; i < floatParamsArray.Size(); i += 1 )
+		{{
+			resultString = StrReplace( resultString, "$F$", {prefix}NoTrailZeros(floatParamsArray[i]) );
+		}}
+	}}
+	if ( stringParamsArray.Size() > 0 && DualSub_CountOccurrences( resultString, "$S$" ) == stringParamsArray.Size() )
+	{{
+		for( i = 0; i < stringParamsArray.Size(); i += 1 )
+		{{
+			resultString = StrReplace( resultString, "$S$", {prefix}stringParamsArray[i] );
+		}}
+	}}
+	
+"""
+PLACEHOLDER_HELPER_TEMPLATE = """
+
+{marker}: helper used by the second placeholder pass above.
+function DualSub_CountOccurrences( str : string, match : string ) : int
+{{
+	var count, idx, matchLen : int;
+	var rest : string;
+	
+	matchLen = StrLen( match );
+	if ( matchLen <= 0 )
+	{{
+		return 0;
+	}}
+	
+	count = 0;
+	rest = str;
+	idx = StrFindFirst( rest, match );
+	while ( idx >= 0 )
+	{{
+		count += 1;
+		rest = StrMid( rest, idx + matchLen );
+		idx = StrFindFirst( rest, match );
+	}}
+	return count;
+}}
+"""
+
+
+class ScriptPatchError(Exception):
+    pass
 
 
 def _ensure_dir(path):
@@ -665,115 +737,239 @@ def _recap_backup_path(bundle_path):
     return f"{bundle_path}{RECAP_BUNDLE_BACKUP_SUFFIX}"
 
 
-def apply_recap_dual_subtitles(source_lang, target_lang, location):
-    source_lang = source_lang.lower()
-    target_lang = target_lang.lower()
+def _bundle_backups(bundles_dir):
+    """All <bundle>.dualsub_backup files in the directory -> [(backup, bundle)]."""
+    result = []
+    for name in sorted(os.listdir(bundles_dir)):
+        if name.lower().endswith(RECAP_BUNDLE_BACKUP_SUFFIX):
+            backup_path = os.path.join(bundles_dir, name)
+            result.append((backup_path, backup_path[: -len(RECAP_BUNDLE_BACKUP_SUFFIX)]))
+    return result
 
-    bundle_path = _locate_recap_bundle(location)
-    if bundle_path is None:
-        print("Recap bundle not found; skipping intro/recap dual subtitle step.")
-        return False, 0
 
+def _reset_bundle_from_backup(bundle_path):
+    """Create the backup on first use, then copy it over the live bundle."""
     backup_path = _recap_backup_path(bundle_path)
     if not os.path.exists(backup_path):
         shutil.copy2(bundle_path, backup_path)
-        print(f"Recap backup created: {backup_path}")
-
-    # Always reset to clean backup so repeated runs remain deterministic.
+        print(f"Bundle backup created: {backup_path}")
     shutil.copy2(backup_path, bundle_path)
 
+
+def apply_recap_dual_subtitles(source_lang, target_lang, location):
+    """Dual subtitles for pre-rendered movies: intro, storybook recaps,
+    flashbacks, final boards and DLC cutscenes.
+
+    Two kinds of data are patched inside the bundles:
+    - <movie>_<lang>.subs files (used by the game for languages without an
+      embedded channel, e.g. tr/hu/ua, and for movies without embedded text)
+    - the embedded @SBT channel of the target language inside each .usm that has
+      one (the game prefers it over the .subs file)
+    Every bundle touched gets a <bundle>.dualsub_backup on first use and is reset
+    from it before patching, so repeated runs are deterministic.
+    """
+    source_lang = source_lang.lower()
+    target_lang = target_lang.lower()
+
+    movies_bundle = _locate_recap_bundle(location)
+    if movies_bundle is None:
+        print("movies.bundle not found; skipping movie subtitle step.")
+        return False, 0
+    bundles_dir = os.path.dirname(movies_bundle)
+
+    # Reset everything that was patched before, so the plan sees original TOCs.
+    already_reset = set()
+    for backup_path, bundle_path in _bundle_backups(bundles_dir):
+        if os.path.exists(bundle_path):
+            shutil.copy2(backup_path, bundle_path)
+            already_reset.add(os.path.normcase(bundle_path))
+
     if source_lang == target_lang:
-        print("Recap bundle restored from backup (source and target languages are the same).")
+        print("Movie bundles restored from backup (source and target languages are the same).")
         return True, 0
 
     try:
-        payload = recap_subs_pipeline.build_merged_recap_payload(
-            bundle_path=bundle_path,
-            target_lang=target_lang,
-            source_lang=source_lang,
-            separator_style=RECAP_SEPARATOR_STYLE,
-            source_first=True,
-        )
-        patched = recap_subs_pipeline.patch_bundle_in_place(
-            bundle_path=bundle_path,
-            entry_to_patch=payload["target_entry"],
-            merged_raw=payload["merged_raw"],
-            align=16,
-        )
-        print(
-            "Recap merge applied: "
-            f"{payload['target_entry'].name} + {payload['source_entry'].name} "
-            f"({len(payload['merged_records'])} records)"
-        )
-        print(f"Recap bundle patched: {patched['output_bundle']}")
+        plan = recap_subs_pipeline.plan_movie_subtitles(bundles_dir, target_lang, source_lang)
     except Exception as exc:
-        print("FAILURE TO PROCESS recap bundle")
+        print("FAILURE TO SCAN movie bundles")
         print(str(exc))
         return True, 1
 
-    # The intro movie (recap_wip.usm) carries its own embedded subtitle channels.
-    # For languages that have a channel (en, de, fr, ...) the game shows those and
-    # ignores the .subs file, so the channel itself must be rewritten.
+    if not plan["bundles"]:
+        print(f"No movie subtitle pairs found for {target_lang}+{source_lang}.")
+        return True, 0
+
+    print(
+        f"Movie subtitles: {len(plan['subs_jobs'])} .subs pairs and "
+        f"{len(plan['usm_jobs'])} movies with subtitle files across "
+        f"{len(plan['bundles'])} bundle(s). This can take a minute..."
+    )
+    for bundle_path in plan["bundles"]:
+        if os.path.normcase(bundle_path) not in already_reset:
+            _reset_bundle_from_backup(bundle_path)
+
     try:
-        usm_result = recap_subs_pipeline.build_merged_recap_usm(
-            bundle_path=bundle_path,
-            target_lang=target_lang,
-            source_lang=source_lang,
+        summary = recap_subs_pipeline.apply_movie_subtitles(
+            bundles_dir,
+            target_lang,
+            source_lang,
             separator_style=RECAP_SEPARATOR_STYLE,
             source_first=True,
+            log=print,
+            sbt_separator_style=RECAP_SBT_SEPARATOR_STYLE,
         )
-        if usm_result is None:
-            print(
-                f"Intro movie has no embedded '{target_lang}' subtitle channel; "
-                "the game uses the patched .subs file for the intro."
-            )
-        else:
-            for warning in usm_result["warnings"]:
-                print(f"WARNING: {warning}")
-            usm_patch = recap_subs_pipeline.patch_bundle_entry_in_place(
-                bundle_path=bundle_path,
-                entry_to_patch=usm_result["usm_entry"],
-                raw=usm_result["new_raw"],
-                compress=False,
-                align=4096,
-            )
-            print(
-                "Intro movie subtitles rewritten: "
-                f"{usm_result['usm_entry'].name} channel {usm_result['channel']} "
-                f"({usm_result['lines_modified']}/{usm_result['lines_total']} lines, "
-                f"{usm_result['original_size']} -> {len(usm_result['new_raw'])} bytes)"
-            )
-            print(f"Intro movie appended at bundle offset {usm_patch['new_offset']}")
-        print(
-            "Note: the game rebuilds content\\metadata.store on the next launch "
-            "because the bundle size changed; the first start may take a bit longer."
-        )
-        return True, 0
     except Exception as exc:
-        print("FAILURE TO PROCESS intro movie subtitles (recap_wip.usm)")
+        print("FAILURE TO PROCESS movie subtitles")
         print(str(exc))
         return True, 1
+
+    print(
+        "Note: the game rebuilds content\\metadata.store on the next launch "
+        "because bundle sizes changed; the first start may take a bit longer."
+    )
+    return True, summary["errors"]
 
 
 def restore_recap_bundle_backup(location):
-    bundle_path = _locate_recap_bundle(location)
-    if bundle_path is None:
-        print("Recap bundle not found; skipping intro/recap undo step.")
+    movies_bundle = _locate_recap_bundle(location)
+    if movies_bundle is None:
+        print("movies.bundle not found; skipping movie undo step.")
         return False, 0, 0
 
-    backup_path = _recap_backup_path(bundle_path)
-    if not os.path.exists(backup_path):
-        print("No recap backup bundle found.")
+    backups = _bundle_backups(os.path.dirname(movies_bundle))
+    if not backups:
+        print("No bundle backups found.")
+        return True, 0, 0
+
+    restored = 0
+    failed = 0
+    for backup_path, bundle_path in backups:
+        try:
+            shutil.copy2(backup_path, bundle_path)
+            print(f"Bundle restored: {bundle_path}")
+            restored += 1
+        except Exception as exc:
+            print(f"FAILURE TO RESTORE bundle {bundle_path}")
+            print(str(exc))
+            failed += 1
+    return True, restored, failed
+
+
+def _locate_game_root(location):
+    """Game root = the folder that holds content\\content0\\scripts\\game\\localizedContent.ws."""
+    if os.path.exists(os.path.join(location, *ORIGINAL_SCRIPT_RELATIVE_PARTS)):
+        return location
+
+    movies_bundle = _locate_recap_bundle(location)
+    if movies_bundle is not None:
+        # <root>\content\content0\bundles\movies.bundle
+        candidate = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(movies_bundle))))
+        if os.path.exists(os.path.join(candidate, *ORIGINAL_SCRIPT_RELATIVE_PARTS)):
+            return candidate
+
+    suffix = os.path.normcase(os.path.join(*ORIGINAL_SCRIPT_RELATIVE_PARTS[1:]))
+    for root, _, files in os.walk(location):
+        for name in files:
+            full_path = os.path.normcase(os.path.join(root, name))
+            if full_path.endswith(suffix):
+                return full_path[: -len(suffix)].rstrip("\\/")
+    return None
+
+
+def _script_mod_path(game_root):
+    return os.path.join(game_root, *SCRIPT_MOD_RELATIVE_PARTS)
+
+
+def build_placeholder_script(original_text):
+    """Patch localizedContent.ws so $I$/$F$/$S$ values are filled in both languages.
+
+    The game replaces one placeholder per parameter (StrReplace hits the first
+    occurrence only). A merged row holds the placeholders twice, so the second
+    language would keep raw '$I$' tokens. The patch repeats the replacement loops
+    once more whenever exactly one copy of each placeholder is still left.
+    """
+    if SCRIPT_MOD_MARKER in original_text:
+        raise ScriptPatchError("localizedContent.ws is already patched; expected the original game file.")
+
+    newline = "\r\n" if "\r\n" in original_text else "\n"
+    text = original_text.replace("\r\n", "\n")
+
+    for function_name, prefix in PLACEHOLDER_FUNCTIONS:
+        function_re = re.compile(
+            r"(function\s+" + re.escape(function_name) + r"\s*\(.*?\n)(\treturn resultString;\n\}\n)",
+            re.S,
+        )
+        match = function_re.search(text)
+        if match is None:
+            raise ScriptPatchError(f"Could not find function {function_name} in localizedContent.ws.")
+        body = match.group(1)
+        for token in ('"$I$"', '"$F$"', '"$S$"', "intParamsArray", "floatParamsArray", "stringParamsArray"):
+            if token not in body:
+                raise ScriptPatchError(f"Function {function_name} does not look like the expected game code ({token} missing).")
+        second_pass = PLACEHOLDER_SECOND_PASS_TEMPLATE.format(marker=SCRIPT_MOD_MARKER, prefix=prefix)
+        text = text[: match.start(2)] + second_pass.lstrip("\n") + text[match.start(2) :]
+
+    text = text.rstrip("\n") + "\n" + PLACEHOLDER_HELPER_TEMPLATE.format(marker=SCRIPT_MOD_MARKER).lstrip("\n")
+    return text.replace("\n", newline)
+
+
+def install_placeholder_script_mod(location):
+    """Write mods\\modDualSubtitles\\...\\localizedContent.ws based on the game's own copy.
+
+    Returns (found, errors)."""
+    game_root = _locate_game_root(location)
+    if game_root is None:
+        print("localizedContent.ws not found; skipping placeholder script mod.")
+        return False, 0
+
+    original_path = os.path.join(game_root, *ORIGINAL_SCRIPT_RELATIVE_PARTS)
+    mod_path = _script_mod_path(game_root)
+    try:
+        # newline="" keeps the original CRLF so the mod file mirrors the game's layout.
+        with open(original_path, "r", encoding="utf-8-sig", newline="") as handle:
+            original_text = handle.read()
+        patched_text = build_placeholder_script(original_text)
+        _ensure_dir(os.path.dirname(mod_path))
+        with open(mod_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(patched_text)
+    except Exception as exc:
+        print("FAILURE TO INSTALL placeholder script mod")
+        print(str(exc))
+        return True, 1
+
+    print(f"Script mod installed: {mod_path}")
+    print(
+        "Note: the game recompiles scripts on the next launch. If another mod also "
+        "changes localizedContent.ws, merge them with Script Merger."
+    )
+    return True, 0
+
+
+def remove_placeholder_script_mod(location):
+    """Delete mods\\modDualSubtitles. Returns (found, removed, failed)."""
+    game_root = _locate_game_root(location)
+    if game_root is None:
+        return False, 0, 0
+
+    mod_dir = os.path.join(game_root, "mods", SCRIPT_MOD_NAME)
+    if not os.path.isdir(mod_dir):
         return True, 0, 0
 
     try:
-        shutil.copy2(backup_path, bundle_path)
-        print(f"Recap bundle restored: {bundle_path}")
-        return True, 1, 0
+        shutil.rmtree(mod_dir)
     except Exception as exc:
-        print(f"FAILURE TO RESTORE recap bundle {bundle_path}")
+        print(f"FAILURE TO REMOVE script mod {mod_dir}")
         print(str(exc))
         return True, 0, 1
+
+    print(f"Script mod removed: {mod_dir}")
+    mods_dir = os.path.dirname(mod_dir)
+    try:
+        if not os.listdir(mods_dir):
+            os.rmdir(mods_dir)
+    except OSError:
+        pass
+    return True, 1, 0
 
 
 def process_files(source_lang, target_lang, location):
@@ -1183,10 +1379,12 @@ def open_ui_dialog():
                 print(f"Selected folder: {selected_folder}")
                 restored, failed = restore_from_backups(target_lang, selected_folder)
                 recap_found, recap_restored, recap_failed = restore_recap_bundle_backup(selected_folder)
+                _, mod_removed, mod_failed = remove_placeholder_script_mod(selected_folder)
+                restored_any = restored > 0 or recap_restored > 0 or mod_removed > 0
 
-                if failed == 0 and recap_failed == 0 and (restored > 0 or recap_restored > 0):
+                if failed == 0 and recap_failed == 0 and mod_failed == 0 and restored_any:
                     result["status"] = "Undo completed."
-                elif restored > 0 or recap_restored > 0:
+                elif restored_any:
                     result["status"] = "Undo completed with some errors. Check log."
                 elif recap_found:
                     result["status"] = "No backups found to undo."
@@ -1201,13 +1399,18 @@ def open_ui_dialog():
                     target_lang=target_lang,
                     location=selected_folder,
                 )
-
-                if recap_failed:
-                    result["status"] = "Merge completed with intro/recap errors. Check log."
-                elif recap_found:
-                    result["status"] = "Merge completed (w3strings + intro/recap)."
+                if source_lang.lower() == target_lang.lower():
+                    remove_placeholder_script_mod(selected_folder)
+                    mod_failed = 0
                 else:
-                    result["status"] = "Merge completed (.w3strings only; recap bundle not found)."
+                    _, mod_failed = install_placeholder_script_mod(selected_folder)
+
+                if recap_failed or mod_failed:
+                    result["status"] = "Merge completed with movie/script errors. Check log."
+                elif recap_found:
+                    result["status"] = "Merge completed (w3strings + movie subtitles + script mod)."
+                else:
+                    result["status"] = "Merge completed (.w3strings only; movies.bundle not found)."
 
             print("--- DONE !       ---")
             print("--- You can exit ---")
@@ -1245,7 +1448,8 @@ def open_ui_dialog():
                 f"Target language (will be modified): {target_lang}\n"
                 f"Source language (will be appended): {source_lang}\n"
                 f"Folder: {selected_folder}\n\n"
-                "This applies dual subtitles for both regular .w3strings and intro/recap subtitles.\n\n"
+                "This applies dual subtitles for .w3strings texts and for movie subtitles "
+                "(intro, story recaps, flashbacks, final boards).\n\n"
                 "Continue with merge?"
             )
             if not messagebox.askyesno("Confirm Merge", summary):
@@ -1315,8 +1519,11 @@ def open_ui_dialog():
     log_stream = redirect_output(output_text, window)
     print("UI ready.")
     print(f"Build: {APP_VERSION}")
-    print(f"Recap separator mode: {RECAP_SEPARATOR_STYLE}")
-    print("Tip: Ctrl+Z restores both w3strings and intro/recap bundle backups.")
+    print(
+        f"Movie subtitle line break: .subs={RECAP_SEPARATOR_STYLE}, "
+        f"embedded={RECAP_SBT_SEPARATOR_STYLE}"
+    )
+    print("Tip: Ctrl+Z restores both w3strings and movie bundle backups.")
 
     def on_close():
         log_stream.close()
@@ -1363,11 +1570,16 @@ def main():
     recap_found, recap_failed = apply_recap_dual_subtitles(source_lang, target_lang, location)
 
     if recap_failed:
-        print("Recap merge finished with errors.")
+        print("Movie subtitle merge finished with errors.")
     elif recap_found:
-        print("Recap merge finished successfully.")
+        print("Movie subtitle merge finished successfully.")
     else:
-        print("Recap bundle not found; recap step skipped.")
+        print("movies.bundle not found; movie subtitle step skipped.")
+
+    if source_lang.lower() == target_lang.lower():
+        remove_placeholder_script_mod(location)
+    else:
+        install_placeholder_script_mod(location)
 
 
 if __name__ == "__main__":

@@ -43,10 +43,11 @@ UI mode:
 
 UI actions:
 
-- Apply Dual Subtitles: single button that applies dual subtitles for both
-    .w3strings files and intro/recap subtitles in movies.bundle.
-- Restore From Backup (Ctrl+Z): single undo button that restores both
-    .w3strings backup files and recap bundle backup.
+- Apply Dual Subtitles: single button that applies dual subtitles for
+    .w3strings files, movie subtitles in movies.bundle/bob.bundle, and installs the
+    mods\modDualSubtitles script mod (numbers in tooltips, see below).
+- Restore From Backup (Ctrl+Z): single undo button that restores the
+    .w3strings backup files and bundle backups and removes the script mod.
 - Long operations run in the background and show a loading bar; the UI stays responsive while processing.
 - Clear Log: clears output panel.
 
@@ -58,26 +59,36 @@ Example:
 
     python dual_subtitles_remastered.py tr en "C:\Program Files (x86)\Steam\steamapps\common\The Witcher 3"
 
-Intro/Recap subtitle pipeline (movies.bundle)
----------------------------------------------
-The recap subtitles shown during intro/loading are not part of .w3strings.
-The UI already applies this automatically, but this script can be used separately
-to inspect files, generate merged recap text, and optionally create a patched bundle copy.
+Movie subtitle pipeline (movies.bundle, bob.bundle)
+---------------------------------------------------
+Subtitles of pre-rendered movies are not part of .w3strings. This covers:
 
-Where the intro text actually comes from:
+- the intro cinematic (movies\cutscenes\gamestart\recap_wip.usm)
+- story recaps shown when continuing a save (movies\cutscenes\storybook\st_*.usm)
+- flashbacks (movies\cutscenes\flashbacks\rs_*.usm)
+- final boards / endings (movies\cutscenes\finalboards\fb_*.usm)
+- DLC cutscenes with subtitle files (dlc\bob\...\cs704_sister_lives_teleport.usm)
 
-- movies\cutscenes\gamestart\recap_wip.usm (the intro cinematic) contains its own
-    embedded subtitle stream (CRI Sofdec @SBT chunks) with 15 language channels:
+The UI applies all of this automatically. recap_subs_pipeline.py can be used separately
+to inspect the intro files and optionally create a patched bundle copy.
+
+Where the movie text actually comes from:
+
+- Every movie has <movie>_<lang>.subs files next to it (subs\ and sometimes altsubs\
+    for the alternative voice track). These are plain "start, end, text" lines.
+- Many movies (intro, flashbacks, final boards, cs704) ALSO contain an embedded
+    subtitle stream (CRI Sofdec @SBT chunks) with up to 15 language channels:
     en, pl, de, it, fr, cz, es, zh, ru, cn, jp, kr, br, esmx, ar.
-- When the game text language has an embedded channel, the game renders THAT text and
-    ignores movies\cutscenes\gamestart\subs\recap_wip_<lang>.subs.
-- Languages without a channel (tr, hu, ua) fall back to the .subs file.
-- The tool therefore patches both: the .subs file (for fallback languages) and the
-    embedded channel of the target language inside recap_wip.usm (rewritten chunks are
-    re-padded to 32 bytes, the CRID file size is updated, and the SBT header limits are
-    raised only if the merged text exceeds the original maximums).
-- The rewritten movie is appended to the bundle and the TOC entry is repointed; nothing
-    inside the original data is overwritten, so the backup/restore flow stays the same.
+- When the text language has an embedded channel, the game renders THAT text and
+    ignores the .subs file. Languages without a channel (tr, hu, ua) and movies without
+    embedded text (storybook recaps) use the .subs file.
+- The tool therefore patches both: every .subs pair for the language combination and
+    the embedded channel of the target language inside every movie that has one
+    (rewritten chunks are re-padded to 32 bytes, the CRID file size is updated, and the
+    SBT header limits are raised only if the merged text exceeds the original maximums).
+- Rewritten movies and subtitle files are appended to their bundle and the TOC entries
+    are repointed; nothing inside the original data is overwritten. Each touched bundle
+    gets a <bundle>.dualsub_backup on first use (movies.bundle and bob.bundle).
 
 content\metadata.store:
 
@@ -102,18 +113,45 @@ Separator options:
 - same-line (default): appends source with " | " delimiter.
 - escaped-newline: appends source as literal "\\n" after target.
 - actual-newline: appends source with real newline character.
+- html-break: appends source after a "<br>" tag.
 
 Intro visibility note:
 
 - In the main app flow the second language is written on the next line, source-first
-    (Turkish, then English on the line below). The in-game .w3strings texts use the
-    same line break: a real newline for plain subtitles, <br> for rows that already
-    contain HTML.
+    (Turkish, then English on the line below).
+    * .subs files: "<br>" (the file is parsed line by line, so a real newline would
+      split the record; the text is shown by the HUD dialog subtitle field, which
+      renders HTML).
+    * embedded movie text (SBT): a real newline character.
+    * .w3strings: a real newline for plain text, <br> for rows that already contain HTML.
 - In recap_subs_pipeline.py CLI the default is still same-line (" | ").
-    Use --separator-style actual-newline --source-first to match the app.
+    Use --separator-style html-break --source-first to match the app's .subs output.
 - The CLI also rewrites the embedded USM channel by default and writes
     <output-dir>\usm\recap_wip.patched.usm plus sbt_<target>_<source>.txt for inspection.
     Use --no-usm to skip that step.
+
+Script mod for numbers in tooltips (mods\modDualSubtitles)
+-----------------------------------------------------------
+Skill/item/perk descriptions keep their numbers as placeholders in .w3strings:
+"$I$" (integer), "$F$" (decimal) and "$S$" (text), e.g.
+"Increases crossbow critical hit chance by $I$%." The values are filled at runtime by
+GetLocStringByKeyExtWithParams / GetLocStringByIdWithParams in
+content\content0\scripts\game\localizedContent.ws, one placeholder per parameter
+(StrReplace replaces the first occurrence only).
+
+A merged row contains each placeholder twice (once per language), so without help
+the game fills the first language and the second one keeps showing raw "$I$".
+The tool therefore writes a small script mod:
+
+    mods\modDualSubtitles\content\scripts\game\localizedContent.ws
+
+It is generated from the game's own localizedContent.ws at apply time: the two
+functions get a second replacement pass that runs only when exactly one copy of each
+placeholder is still left, plus a helper DualSub_CountOccurrences. Everything else in
+the file is unchanged. The game recompiles scripts on the next launch (slightly longer
+first start). Restore From Backup (or applying with source == target) deletes the mod.
+
+If you use other mods that change localizedContent.ws, merge them with Script Merger.
 
 Important:
 

@@ -188,61 +188,162 @@ def parse_subtitle_records(text):
 
 
 def render_subtitle_text(header_value, records):
-    lines = [str(header_value), ""]
+    """Render records in the exact layout the game ships:
+    'header\\r\\n' then one 'start, end, text\\r\\n' per record, no blank lines."""
+    lines = [str(header_value)]
     for record in records:
         # One record per line. A line break inside the text is stored as the
         # two-character \n escape so it does not split the record.
-        text = record.text.replace("\n", "\\n")
+        text = record.text.replace("\r", "").replace("\n", "\\n")
         lines.append(f"{record.start_ms}, {record.end_ms}, {text}")
-        lines.append("")
-    return "\n".join(lines) + "\n"
+    return "\r\n".join(lines) + "\r\n"
 
 
-def merge_records(target_records, source_records, separator_style, source_first=False):
-    if len(target_records) != len(source_records):
-        raise ValueError(
-            "Record count mismatch between target and source subtitle files: "
-            f"{len(target_records)} vs {len(source_records)}"
-        )
+PAIRING_TOLERANCE_MS = 2500
 
+
+SEPARATOR_STYLES = ("same-line", "escaped-newline", "actual-newline", "html-break")
+
+
+def separator_for_style(separator_style):
     if separator_style == "escaped-newline":
-        separator = r"\n"
-    elif separator_style == "same-line":
-        separator = " | "
-    elif separator_style == "actual-newline":
-        separator = "\n"
-    else:
-        raise ValueError(f"Unknown separator style: {separator_style}")
+        return r"\n"
+    if separator_style == "same-line":
+        return " | "
+    if separator_style == "actual-newline":
+        return "\n"
+    if separator_style == "html-break":
+        # .subs files are parsed line by line, so a real newline would split the
+        # record. The text ends up in the HUD dialog subtitle field (HTML text),
+        # where <br> renders as a line break.
+        return "<br>"
+    raise ValueError(f"Unknown separator style: {separator_style}")
+
+
+def pair_by_timing(target_starts, source_records, tolerance_ms=PAIRING_TOLERANCE_MS):
+    """Map each target line (by position) to a source record.
+
+    When both sides have the same number of lines they are paired by position
+    (language variants of the same movie occasionally differ by a few hundred
+    milliseconds). Otherwise each target line takes the closest unused source
+    record within tolerance. Returns (pairs, warnings) where pairs[i] is a
+    SubtitleRecord or None.
+    """
+    warnings = []
+    if len(target_starts) == len(source_records):
+        drift = [
+            abs(start - record.start_ms)
+            for start, record in zip(target_starts, source_records)
+            if abs(start - record.start_ms) > 0
+        ]
+        if drift:
+            warnings.append(
+                f"{len(drift)} line(s) paired by position with timing drift up to {max(drift)} ms."
+            )
+        return list(source_records), warnings
+
+    used = set()
+    pairs = []
+    for start in target_starts:
+        best_index = None
+        best_delta = None
+        for index, record in enumerate(source_records):
+            if index in used:
+                continue
+            delta = abs(record.start_ms - start)
+            if delta <= tolerance_ms and (best_delta is None or delta < best_delta):
+                best_index, best_delta = index, delta
+        if best_index is None:
+            pairs.append(None)
+        else:
+            used.add(best_index)
+            pairs.append(source_records[best_index])
+    missing = sum(1 for pair in pairs if pair is None)
+    warnings.append(
+        f"Line count differs ({len(target_starts)} vs {len(source_records)}); "
+        f"paired by nearest start time, {missing} line(s) left single-language."
+    )
+    return pairs, warnings
+
+
+def combine_texts(target_text, source_text, separator, source_first):
+    target_text = target_text.strip()
+    source_text = (source_text or "").strip()
+    if not source_text or source_text in target_text:
+        return target_text
+    if source_first:
+        return f"{source_text}{separator}{target_text}"
+    return f"{target_text}{separator}{source_text}"
+
+
+def merge_records_with_warnings(target_records, source_records, separator_style, source_first=False):
+    separator = separator_for_style(separator_style)
+    pairs, warnings = pair_by_timing([record.start_ms for record in target_records], source_records)
 
     merged = []
-    for index, (target_rec, source_rec) in enumerate(zip(target_records, source_records), start=1):
-        if target_rec.start_ms != source_rec.start_ms or target_rec.end_ms != source_rec.end_ms:
-            raise ValueError(
-                "Timing mismatch at record index "
-                f"{index}: target=({target_rec.start_ms}, {target_rec.end_ms}) "
-                f"source=({source_rec.start_ms}, {source_rec.end_ms})"
-            )
-
-        source_text = source_rec.text.strip()
-        target_text = target_rec.text.strip()
-
-        if source_text and source_text not in target_text:
-            if source_first:
-                merged_text = f"{source_rec.text}{separator}{target_rec.text}"
-            else:
-                merged_text = f"{target_rec.text}{separator}{source_rec.text}"
-        else:
-            merged_text = target_rec.text
-
+    for target_rec, source_rec in zip(target_records, pairs):
         merged.append(
             SubtitleRecord(
                 start_ms=target_rec.start_ms,
                 end_ms=target_rec.end_ms,
-                text=merged_text,
+                text=combine_texts(
+                    target_rec.text,
+                    source_rec.text if source_rec is not None else "",
+                    separator,
+                    source_first,
+                ),
             )
         )
+    return merged, warnings
 
-    return merged
+
+def merge_records(target_records, source_records, separator_style, source_first=False):
+    return merge_records_with_warnings(target_records, source_records, separator_style, source_first)[0]
+
+
+SUBS_NAME_RE = re.compile(r"^(?P<base>.+)_(?P<lang>[a-z]+)\.subs$", re.IGNORECASE)
+
+
+def split_subs_name(name):
+    """'movies\\...\\subs\\st_1_en.subs' -> ('movies\\...\\subs\\st_1', 'en') or None."""
+    match = SUBS_NAME_RE.match(name)
+    if not match:
+        return None
+    return match.group("base"), match.group("lang").lower()
+
+
+def collect_subs_pairs(entries, target_lang, source_lang):
+    """All (target_entry, source_entry) .subs pairs in one bundle's TOC."""
+    target_lang = target_lang.lower()
+    source_lang = source_lang.lower()
+    by_base = {}
+    for entry in entries:
+        if not entry.name.lower().endswith(".subs"):
+            continue
+        parts = split_subs_name(entry.name)
+        if parts is None:
+            continue
+        base, lang = parts
+        by_base.setdefault(base.lower(), {})[lang] = entry
+    pairs = []
+    for base in sorted(by_base):
+        langs = by_base[base]
+        if target_lang in langs and source_lang in langs:
+            pairs.append((langs[target_lang], langs[source_lang]))
+    return pairs
+
+
+def subs_name_for_movie(usm_name, lang, folder="subs"):
+    """'movies\\cutscenes\\storybook\\st_1.usm' -> 'movies\\cutscenes\\storybook\\subs\\st_1_en.subs'."""
+    directory, file_name = os.path.split(usm_name)
+    base = os.path.splitext(file_name)[0]
+    return os.path.join(directory, folder, f"{base}_{lang.lower()}.subs")
+
+
+def load_subs_records(bundle_path, entry):
+    payload = read_entry_payload(bundle_path, entry)
+    text = decode_subs_text(decode_subs_payload(entry, payload))
+    return parse_subtitle_records(text)
 
 
 def find_recap_entry(entries, language_code):
@@ -599,16 +700,16 @@ def detect_sbt_channel(sbt_lines, target_records, expected_channel=None, sample_
     """Pick the SBT channel whose texts match the target .subs records best."""
     import difflib
 
-    by_start = {record.start_ms: record for record in target_records}
     scores = {}
     channels = sorted({line.channel for line in sbt_lines})
     for channel in channels:
-        lines = [line for line in sbt_lines if line.channel == channel][:sample_size]
-        pairs = []
-        for line in lines:
-            record = by_start.get(line.start)
-            if record is not None:
-                pairs.append((_normalize_subtitle_text(line.text), _normalize_subtitle_text(record.text)))
+        lines = [line for line in sbt_lines if line.channel == channel]
+        paired, _ = pair_by_timing([line.start for line in lines], target_records)
+        pairs = [
+            (_normalize_subtitle_text(line.text), _normalize_subtitle_text(record.text))
+            for line, record in list(zip(lines, paired))[:sample_size]
+            if record is not None
+        ]
         if not pairs:
             scores[channel] = 0.0
             continue
@@ -620,50 +721,52 @@ def detect_sbt_channel(sbt_lines, target_records, expected_channel=None, sample_
     return best_channel, best_score, scores
 
 
-def build_merged_recap_usm(bundle_path, target_lang, source_lang, separator_style, source_first=False):
-    """Rewrite the target language SBT channel of recap_wip.usm with merged lines.
+SBT_STREAM_ID = 0x40534254  # '@SBT' as big-endian uint32 in the CRID directory
 
-    Returns None when the target language has no embedded SBT channel (the game
-    then falls back to recap_wip_<lang>.subs, which is handled separately).
+
+def usm_has_sbt_stream(bundle_path, entry):
+    """Check the CRID directory only (first chunk) for an @SBT stream row."""
+    with open(bundle_path, "rb") as handle:
+        handle.seek(entry.offset)
+        prefix = handle.read(8)
+        if len(prefix) < 8 or prefix[:4] != b"CRID":
+            return False
+        size = struct.unpack(">I", prefix[4:8])[0]
+        crid = prefix + handle.read(size)
+    header_size = crid[9]
+    try:
+        _, rows = _utf_row_fields(crid, 8 + header_size)
+    except (ValueError, struct.error, IndexError):
+        return False
+    return any(row.get("stmid", (None, None, None))[2] == SBT_STREAM_ID for row in rows)
+
+
+def build_merged_usm(
+    bundle_path,
+    usm_entry,
+    target_records,
+    source_records,
+    target_lang,
+    separator_style,
+    source_first=False,
+):
+    """Rewrite the target language SBT channel of one USM movie with merged lines.
+
+    target_records / source_records come from the movie's <name>_<lang>.subs
+    files (they may live in another bundle). Returns None when the movie has no
+    embedded subtitles or no channel for the target language; the game then
+    shows the .subs file, which is patched separately.
     """
     bundle_path = os.path.abspath(bundle_path)
     target_lang = target_lang.lower()
-    source_lang = source_lang.lower()
+    separator = separator_for_style(separator_style)
 
-    if separator_style == "escaped-newline":
-        separator = r"\n"
-    elif separator_style == "same-line":
-        separator = " | "
-    elif separator_style == "actual-newline":
-        separator = "\n"
-    else:
-        raise ValueError(f"Unknown separator style: {separator_style}")
-
-    header, entries = load_bundle_entries(bundle_path)
-    usm_entry = find_entry_by_name(entries, RECAP_USM_NAME)
-    if usm_entry is None:
-        raise ValueError(f"Could not find intro movie entry: {RECAP_USM_NAME}")
     if usm_entry.compression_flag != 0:
-        raise ValueError("Unexpected compressed USM entry; refusing to rewrite.")
-
-    target_entry = find_recap_entry(entries, target_lang)
-    source_entry = find_recap_entry(entries, source_lang)
-    if target_entry is None:
-        raise ValueError(f"Could not find target recap entry for language: {target_lang}")
-    if source_entry is None:
-        raise ValueError(f"Could not find source recap entry for language: {source_lang}")
-
-    def load_records(entry):
-        payload = read_entry_payload(bundle_path, entry)
-        text = decode_subs_text(decode_subs_payload(entry, payload))
-        return parse_subtitle_records(text)[1]
-
-    target_records = load_records(target_entry)
-    source_records = load_records(source_entry)
+        raise ValueError(f"Unexpected compressed USM entry {usm_entry.name}; refusing to rewrite.")
 
     raw = read_entry_payload(bundle_path, usm_entry)
     if raw[:4] != b"CRID":
-        raise ValueError("Intro movie payload does not start with a CRID chunk.")
+        raise ValueError(f"{usm_entry.name} does not start with a CRID chunk.")
 
     chunks = list(iter_usm_chunks(raw))
     sbt_lines = []
@@ -697,35 +800,28 @@ def build_merged_recap_usm(bundle_path, target_lang, source_lang, separator_styl
             "using detected channel."
         )
 
-    source_by_start = {record.start_ms: record for record in source_records}
     target_lines = [line for line in sbt_lines if line.channel == channel]
+    paired_sources, pairing_warnings = pair_by_timing(
+        [line.start for line in target_lines], source_records
+    )
+    warnings.extend(pairing_warnings)
     replacements = {}
     merged_preview = []
     max_content = 0
     max_chunk = 0
-    unmatched = 0
-    for position, line in enumerate(target_lines):
-        source_record = source_by_start.get(line.start)
-        if source_record is None and position < len(source_records):
-            source_record = source_records[position]
-            unmatched += 1
-        target_text = line.text.strip()
-        source_text = source_record.text.strip() if source_record is not None else ""
-        if source_text and source_text not in target_text:
-            if source_first:
-                merged_text = f"{source_text}{separator}{target_text}"
-            else:
-                merged_text = f"{target_text}{separator}{source_text}"
-        else:
-            merged_text = target_text
+    for line, source_record in zip(target_lines, paired_sources):
+        merged_text = combine_texts(
+            line.text,
+            source_record.text if source_record is not None else "",
+            separator,
+            source_first,
+        )
         merged_preview.append((line.start, line.start + line.duration, merged_text))
         chunk = chunks[line.chunk_index][1]
         new_chunk, content_size, total_size = build_sbt_data_chunk(raw, chunk, line, merged_text)
         replacements[line.chunk_index] = new_chunk
         max_content = max(max_content, content_size)
         max_chunk = max(max_chunk, total_size)
-    if unmatched:
-        warnings.append(f"{unmatched} SBT line(s) matched by order instead of start time.")
 
     # Account for untouched channels when deciding header maxima.
     for line in sbt_lines:
@@ -771,7 +867,6 @@ def build_merged_recap_usm(bundle_path, target_lang, source_lang, separator_styl
         "bundle": bundle_path,
         "usm_entry": usm_entry,
         "target_language": target_lang,
-        "source_language": source_lang,
         "channel": channel,
         "channel_score": score,
         "channel_scores": scores,
@@ -785,6 +880,59 @@ def build_merged_recap_usm(bundle_path, target_lang, source_lang, separator_styl
         "warnings": warnings,
         "original_size": len(raw),
         "new_raw": bytes(out),
+    }
+
+
+def build_merged_recap_usm(bundle_path, target_lang, source_lang, separator_style, source_first=False):
+    """Intro movie convenience wrapper around build_merged_usm."""
+    bundle_path = os.path.abspath(bundle_path)
+    header, entries = load_bundle_entries(bundle_path)
+    usm_entry = find_entry_by_name(entries, RECAP_USM_NAME)
+    if usm_entry is None:
+        raise ValueError(f"Could not find intro movie entry: {RECAP_USM_NAME}")
+    target_entry = find_recap_entry(entries, target_lang)
+    source_entry = find_recap_entry(entries, source_lang)
+    if target_entry is None:
+        raise ValueError(f"Could not find target recap entry for language: {target_lang}")
+    if source_entry is None:
+        raise ValueError(f"Could not find source recap entry for language: {source_lang}")
+    result = build_merged_usm(
+        bundle_path,
+        usm_entry,
+        load_subs_records(bundle_path, target_entry)[1],
+        load_subs_records(bundle_path, source_entry)[1],
+        target_lang,
+        separator_style,
+        source_first,
+    )
+    if result is not None:
+        result["source_language"] = source_lang.lower()
+    return result
+
+
+def build_merged_subs_payload(
+    bundle_path, target_entry, source_entry, separator_style, source_first=False, source_bundle_path=None
+):
+    """Merge one <name>_<target>.subs with its <name>_<source>.subs counterpart."""
+    bundle_path = os.path.abspath(bundle_path)
+    source_bundle_path = os.path.abspath(source_bundle_path or bundle_path)
+
+    target_header, target_records = load_subs_records(bundle_path, target_entry)
+    source_header, source_records = load_subs_records(source_bundle_path, source_entry)
+    merged_records, warnings = merge_records_with_warnings(
+        target_records, source_records, separator_style, source_first
+    )
+    merged_text = render_subtitle_text(target_header, merged_records)
+    merged_raw = merged_text.encode("utf-16")
+    return {
+        "target_entry": target_entry,
+        "source_entry": source_entry,
+        "target_records": target_records,
+        "source_records": source_records,
+        "merged_records": merged_records,
+        "merged_text": merged_text,
+        "merged_raw": merged_raw,
+        "warnings": warnings,
     }
 
 
@@ -845,6 +993,150 @@ def build_merged_recap_payload(bundle_path, target_lang, source_lang, separator_
         "merged_raw": merged_raw,
         "merged_zlib": merged_compressed,
     }
+
+
+def plan_movie_subtitles(bundles_dir, target_lang, source_lang):
+    """Inspect every bundle in bundles_dir and list the work for one language pair.
+
+    Returns a dict with:
+      subs_jobs: [(bundle_path, target_entry, source_bundle_path, source_entry)]
+      usm_jobs:  [(bundle_path, usm_entry, target_subs_ref, source_subs_ref)]
+                 where *_ref = (bundle_path, entry)
+      bundles:   sorted list of bundle paths that will be modified
+    Movies are listed only when a subs pair exists for them; whether a movie
+    really carries embedded subtitles is checked later (usm_has_sbt_stream).
+    """
+    target_lang = target_lang.lower()
+    source_lang = source_lang.lower()
+    bundle_paths = sorted(
+        os.path.join(bundles_dir, name)
+        for name in os.listdir(bundles_dir)
+        if name.lower().endswith(".bundle")
+    )
+
+    subs_index = {}
+    movies = []
+    tocs = {}
+    for bundle_path in bundle_paths:
+        try:
+            _, entries = load_bundle_entries(bundle_path)
+        except (ValueError, OSError):
+            continue
+        tocs[bundle_path] = entries
+        for entry in entries:
+            lower = entry.name.lower()
+            if lower.endswith(".subs"):
+                subs_index[lower] = (bundle_path, entry)
+            elif lower.endswith(".usm"):
+                movies.append((bundle_path, entry))
+
+    subs_jobs = []
+    for bundle_path, entries in tocs.items():
+        for target_entry, source_entry in collect_subs_pairs(entries, target_lang, source_lang):
+            subs_jobs.append((bundle_path, target_entry, bundle_path, source_entry))
+
+    usm_jobs = []
+    for bundle_path, usm_entry in movies:
+        target_ref = subs_index.get(subs_name_for_movie(usm_entry.name, target_lang).lower())
+        source_ref = subs_index.get(subs_name_for_movie(usm_entry.name, source_lang).lower())
+        if target_ref is None or source_ref is None:
+            continue  # no subtitle files at all for this movie
+        usm_jobs.append((bundle_path, usm_entry, target_ref, source_ref))
+
+    bundles = sorted({job[0] for job in subs_jobs} | {job[0] for job in usm_jobs})
+    return {
+        "bundles": bundles,
+        "subs_jobs": subs_jobs,
+        "usm_jobs": usm_jobs,
+    }
+
+
+def apply_movie_subtitles(
+    bundles_dir,
+    target_lang,
+    source_lang,
+    separator_style,
+    source_first,
+    log=print,
+    sbt_separator_style=None,
+):
+    """Patch every .subs pair and every embedded SBT channel for the language pair.
+
+    separator_style applies to .subs files; sbt_separator_style (default: same)
+    applies to embedded SBT text, which can safely hold a real newline.
+    Bundles must already be in their original state (caller handles backups).
+    Returns a summary dict.
+    """
+    if sbt_separator_style is None:
+        sbt_separator_style = separator_style
+    plan = plan_movie_subtitles(bundles_dir, target_lang, source_lang)
+    summary = {
+        "subs_patched": 0,
+        "usm_patched": 0,
+        "usm_without_sbt": 0,
+        "usm_without_channel": 0,
+        "errors": 0,
+        "bundles": plan["bundles"],
+    }
+
+    for bundle_path, target_entry, source_bundle_path, source_entry in plan["subs_jobs"]:
+        try:
+            payload = build_merged_subs_payload(
+                bundle_path, target_entry, source_entry, separator_style, source_first, source_bundle_path
+            )
+            # TOC offsets change after each append, so re-read the entry before patching.
+            _, entries = load_bundle_entries(bundle_path)
+            fresh_entry = find_entry_by_name(entries, target_entry.name)
+            # Keep the original storage form: some .subs ship zlib-compressed, others raw.
+            patch_bundle_entry_in_place(
+                bundle_path,
+                fresh_entry,
+                payload["merged_raw"],
+                compress=(fresh_entry.compression_flag == 1),
+                align=16,
+            )
+            for warning in payload["warnings"]:
+                log(f"  WARNING {target_entry.name}: {warning}")
+            summary["subs_patched"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            log(f"  FAILURE {target_entry.name}: {exc}")
+    log(f"Subtitle files patched: {summary['subs_patched']} (.subs pairs {target_lang}+{source_lang})")
+
+    for bundle_path, usm_entry, target_ref, source_ref in plan["usm_jobs"]:
+        try:
+            _, entries = load_bundle_entries(bundle_path)
+            fresh_usm = find_entry_by_name(entries, usm_entry.name)
+            if not usm_has_sbt_stream(bundle_path, fresh_usm):
+                summary["usm_without_sbt"] += 1
+                continue
+            # The target .subs entry was just repointed to merged text. The entry
+            # objects captured by the plan still carry the original offsets, and
+            # patching leaves old payloads in place, so they read the original text.
+            target_records = load_subs_records(target_ref[0], target_ref[1])[1]
+            source_records = load_subs_records(source_ref[0], source_ref[1])[1]
+            result = build_merged_usm(
+                bundle_path, fresh_usm, target_records, source_records, target_lang, sbt_separator_style, source_first
+            )
+            if result is None:
+                summary["usm_without_channel"] += 1
+                continue
+            for warning in result["warnings"]:
+                log(f"  WARNING {usm_entry.name}: {warning}")
+            patch_bundle_entry_in_place(bundle_path, fresh_usm, result["new_raw"], compress=False, align=4096)
+            summary["usm_patched"] += 1
+            log(
+                f"  Movie rewritten: {usm_entry.name} channel {result['channel']} "
+                f"({result['lines_modified']} lines, +{len(result['new_raw']) - result['original_size']} bytes)"
+            )
+        except Exception as exc:
+            summary["errors"] += 1
+            log(f"  FAILURE {usm_entry.name}: {exc}")
+    log(
+        f"Movies rewritten: {summary['usm_patched']}; without embedded subtitles: "
+        f"{summary['usm_without_sbt']}; without '{target_lang}' channel: {summary['usm_without_channel']}"
+    )
+    return summary
 
 
 def command_build(args):
@@ -1046,11 +1338,12 @@ def build_parser():
     )
     parser.add_argument(
         "--separator-style",
-        choices=["escaped-newline", "same-line", "actual-newline"],
+        choices=list(SEPARATOR_STYLES),
         default="same-line",
         help=(
             "How target and source lines are joined: escaped-newline => literal \\n, "
-            "same-line => ' | ', actual-newline => real newline character."
+            "same-line => ' | ', actual-newline => real newline character, "
+            "html-break => '<br>' (the only line break that survives the .subs parser)."
         ),
     )
     parser.add_argument(
